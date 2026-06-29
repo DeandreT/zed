@@ -3279,7 +3279,7 @@ Examples:
 
 - Description:
   Preview tabs allow you to open files in preview mode, where they close automatically when you switch to another file unless you explicitly pin them. This is useful for quickly viewing files without cluttering your workspace. Preview tabs display their file names in italics. \
-   There are several ways to convert a preview tab into a regular tab:
+  There are several ways to convert a preview tab into a regular tab:
 
   - Double-clicking on the file
   - Double-clicking on the tab header
@@ -4011,7 +4011,7 @@ Positive integer values
 
 **Options**
 
-1. `none` to avoid wrapping generally, unless the line is too long
+1. `none` to never wrap; long lines extend horizontally and scroll
 2. `prefer_line` (deprecated, same as `none`)
 3. `editor_width` to wrap lines that overflow the editor width
 4. `bounded` to wrap lines at the minimum of `editor_width` and `preferred_line_length`

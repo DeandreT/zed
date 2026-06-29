@@ -134,7 +134,7 @@ use crate::{
     EditorStyle, RowExt, hover_links::InlayHighlight, inlays::Inlay, movement::TextLayoutDetails,
 };
 use block_map::{BlockPointCursor, BlockRow, BlockSnapshot};
-use fold_map::{FoldPointCursor, FoldSnapshot};
+use fold_map::{Chunk, FoldPointCursor, FoldSnapshot};
 use inlay_map::{BufferOffsetToInlayPointCursor, InlaySnapshot};
 use tab_map::{TabPointCursor, TabSnapshot};
 use wrap_map::{WrapMap, WrapPatch, WrapPointCursor};
@@ -1814,15 +1814,59 @@ impl DisplaySnapshot {
         language_aware: LanguageAwareStyling,
         editor_style: &'a EditorStyle,
     ) -> impl Iterator<Item = HighlightedChunk<'a>> {
-        self.chunks(
+        let chunks = self.chunks(
             display_rows,
             language_aware,
             HighlightStyles {
                 inlay_hint: Some(editor_style.inlay_hints_style),
                 edit_prediction: Some(editor_style.edit_prediction_styles),
             },
-        )
-        .flat_map({
+        );
+        self.map_to_highlighted_chunks(chunks, editor_style)
+    }
+
+    /// Like [`Self::highlighted_chunks`], but for an arbitrary display-point
+    /// range, including a column sub-range of a row. Chunks are fetched through
+    /// the wrap layer, whose cursors seek in O(log n) and walk only the
+    /// requested range, so the cost is independent of the full line length.
+    ///
+    /// The range is clipped to valid positions, so callers may pass columns
+    /// that land inside multi-byte characters.
+    ///
+    /// This returns text content only; block decorations (which occupy whole
+    /// rows and are rendered separately) do not contribute chunks.
+    pub fn highlighted_chunks_in_range<'a>(
+        &'a self,
+        range: Range<DisplayPoint>,
+        language_aware: LanguageAwareStyling,
+        editor_style: &'a EditorStyle,
+    ) -> impl Iterator<Item = HighlightedChunk<'a>> {
+        let range =
+            self.clip_point(range.start, Bias::Left)..self.clip_point(range.end, Bias::Right);
+        let start = self.block_snapshot.to_wrap_point(range.start.0, Bias::Left);
+        let end = self.block_snapshot.to_wrap_point(range.end.0, Bias::Right);
+        let chunks = self.wrap_snapshot().chunks(
+            start..end,
+            language_aware,
+            Highlights {
+                text_highlights: Some(&self.text_highlights),
+                inlay_highlights: Some(&self.inlay_highlights),
+                semantic_token_highlights: Some(&self.semantic_token_highlights),
+                styles: HighlightStyles {
+                    inlay_hint: Some(editor_style.inlay_hints_style),
+                    edit_prediction: Some(editor_style.edit_prediction_styles),
+                },
+            },
+        );
+        self.map_to_highlighted_chunks(chunks, editor_style)
+    }
+
+    fn map_to_highlighted_chunks<'a>(
+        &'a self,
+        chunks: impl Iterator<Item = Chunk<'a>> + 'a,
+        editor_style: &'a EditorStyle,
+    ) -> impl Iterator<Item = HighlightedChunk<'a>> + 'a {
+        chunks.flat_map({
             // track the current underline style so that we can apply it to
             // inlay hints within the diagnostic's span
             let mut current_diagnostic_underline: Option<UnderlineStyle> = None;
@@ -2012,7 +2056,12 @@ impl DisplaySnapshot {
         display_point: DisplayPoint,
         text_layout_details: &TextLayoutDetails,
     ) -> Pixels {
-        let line = self.layout_row(display_point.row(), text_layout_details);
+        let row = display_point.row();
+        // `line_len` panics on rows past the end, which callers may pass.
+        if row <= self.max_point().row() && self.line_len(row) as usize > crate::MAX_LINE_LEN {
+            return self.grid_cell_width(text_layout_details) * display_point.column() as f32;
+        }
+        let line = self.layout_row(row, text_layout_details);
         line.x_for_index(display_point.column() as usize)
     }
 
@@ -2022,8 +2071,37 @@ impl DisplaySnapshot {
         x: Pixels,
         details: &TextLayoutDetails,
     ) -> u32 {
+        if display_row > self.max_point().row() {
+            return 0;
+        }
+        let line_len = self.line_len(display_row);
+        if line_len as usize > crate::MAX_LINE_LEN {
+            let cell_width = self.grid_cell_width(details);
+            let column = if cell_width <= Pixels::ZERO {
+                0
+            } else {
+                ((x / cell_width).round() as u32).min(line_len)
+            };
+            return self
+                .clip_point(DisplayPoint::new(display_row, column), Bias::Left)
+                .column();
+        }
         let layout_line = self.layout_row(display_row, details);
         layout_line.closest_index_for_x(x) as u32
+    }
+
+    /// Rows longer than [`crate::MAX_LINE_LEN`] are never shaped whole; the
+    /// renderer positions their columns on a monospace grid, mirrored here.
+    fn grid_cell_width(&self, details: &TextLayoutDetails) -> Pixels {
+        let font_id = details
+            .text_system
+            .resolve_font(&details.editor_style.text.font());
+        let font_size = details
+            .editor_style
+            .text
+            .font_size
+            .to_pixels(details.rem_size);
+        details.text_system.em_layout_width(font_id, font_size)
     }
 
     #[instrument(skip_all)]
@@ -3300,6 +3378,110 @@ pub mod tests {
                 ("() {}\n}".to_string(), Some(Hsla::red())),
             ]
         );
+    }
+
+    #[gpui::test]
+    async fn test_highlighted_chunks_in_range_clips_to_char_boundaries(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| init_test(cx, &|_| {}));
+
+        let buffer = cx.new(|cx| Buffer::local(format!("{}\nplain", "α".repeat(16)), cx));
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        let map = cx.new(|cx| {
+            DisplayMap::new(
+                buffer,
+                font("Helvetica"),
+                px(14.0),
+                None,
+                1,
+                1,
+                FoldPlaceholder::test(),
+                DiagnosticSeverity::Warning,
+                cx,
+            )
+        });
+        let snapshot = cx.update(|cx| map.update(cx, |map, cx| map.snapshot(cx)));
+        let style = EditorStyle::default();
+        let language_aware = LanguageAwareStyling {
+            tree_sitter: false,
+            diagnostics: false,
+        };
+        let chunks_text = |range: Range<DisplayPoint>| {
+            snapshot
+                .highlighted_chunks_in_range(range, language_aware, &style)
+                .map(|chunk| chunk.text)
+                .collect::<String>()
+        };
+
+        assert_eq!(
+            chunks_text(DisplayPoint::new(DisplayRow(0), 2)..DisplayPoint::new(DisplayRow(0), 8)),
+            "ααα"
+        );
+        // "α" is 2 bytes: mid-character starts clip left, ends clip right.
+        assert_eq!(
+            chunks_text(DisplayPoint::new(DisplayRow(0), 3)..DisplayPoint::new(DisplayRow(0), 9)),
+            "αααα"
+        );
+        assert_eq!(
+            chunks_text(DisplayPoint::new(DisplayRow(0), 31)..DisplayPoint::new(DisplayRow(1), 3)),
+            "α\npla"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_navigation_on_huge_unwrapped_lines_uses_monospace_grid(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| init_test(cx, &|_| {}));
+
+        let mut cx = crate::test::editor_test_context::EditorTestContext::new(cx).await;
+        let editor = cx.editor.clone();
+        let window = cx.window;
+
+        _ = cx.update_window(window, |_, window, cx| {
+            let text_layout_details =
+                editor.update(cx, |editor, cx| editor.text_layout_details(window, cx));
+
+            let long_len = crate::MAX_LINE_LEN * 2;
+            let text = format!("{}\n{}\nshort", "x".repeat(long_len), "α".repeat(long_len));
+            let buffer = MultiBuffer::build_simple(&text, cx);
+            let map = cx.new(|cx| {
+                DisplayMap::new(
+                    buffer,
+                    font("Helvetica"),
+                    px(12.0),
+                    None,
+                    1,
+                    1,
+                    FoldPlaceholder::test(),
+                    DiagnosticSeverity::Warning,
+                    cx,
+                )
+            });
+            let snapshot = map.update(cx, |map, cx| map.snapshot(cx));
+
+            let column = (long_len - 10) as u32;
+            let x = snapshot.x_for_display_point(
+                DisplayPoint::new(DisplayRow(0), column),
+                &text_layout_details,
+            );
+            assert!(x > gpui::Pixels::ZERO);
+            assert_eq!(
+                snapshot.display_column_for_x(DisplayRow(0), x, &text_layout_details),
+                column
+            );
+
+            // A column landing inside a 2-byte character clips to its boundary.
+            let odd_x = snapshot.x_for_display_point(
+                DisplayPoint::new(DisplayRow(0), (long_len - 9) as u32),
+                &text_layout_details,
+            );
+            assert_eq!(
+                snapshot.display_column_for_x(DisplayRow(1), odd_x, &text_layout_details),
+                (long_len - 10) as u32
+            );
+        });
     }
 
     #[gpui::test]
