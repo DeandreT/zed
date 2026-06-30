@@ -21,7 +21,7 @@ use parking_lot::Mutex;
 use postage::oneshot;
 use rpc::{AnyProtoClient, proto};
 
-use util::{ResultExt, maybe, paths::compare_rel_paths, rel_path::RelPath};
+use util::{ResultExt, maybe, rel_path::RelPath};
 use worktree::{Entry, ProjectEntryId, Snapshot, Worktree, WorktreeSettings};
 
 use crate::{
@@ -180,6 +180,7 @@ impl Search {
                 unnamed_buffers.push(handle)
             };
         }
+        unnamed_buffers.sort_by_key(|buffer| buffer.entity_id().to_string());
         let open_buffers = Arc::new(open_buffers);
         let executor = cx.background_executor().clone();
         let (tx, rx) = unbounded();
@@ -645,14 +646,21 @@ impl Search {
             })
             .cloned()
             .collect::<Vec<_>>();
+        // Must match the `PathKey` ordering, otherwise incremental search's stale excerpt
+        // removal in the results multibuffer misbehaves.
         buffers.sort_by(|a, b| {
+            let a_entity_id = a.entity_id();
+            let b_entity_id = b.entity_id();
             let a = a.read(cx);
             let b = b.read(cx);
             match (a.file(), b.file()) {
-                (None, None) => a.remote_id().cmp(&b.remote_id()),
+                (None, None) => a_entity_id.to_string().cmp(&b_entity_id.to_string()),
                 (None, Some(_)) => std::cmp::Ordering::Less,
                 (Some(_), None) => std::cmp::Ordering::Greater,
-                (Some(a), Some(b)) => compare_rel_paths((a.path(), true), (b.path(), true)),
+                (Some(a), Some(b)) => a
+                    .worktree_id(cx)
+                    .cmp(&b.worktree_id(cx))
+                    .then_with(|| a.path().cmp(b.path())),
             }
         });
 
