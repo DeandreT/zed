@@ -231,6 +231,7 @@ impl AgentServerStore {
             agent_servers.insert(
                 registry_id.to_string(),
                 settings.unwrap_or_else(|| settings::CustomAgentServerSettings::Registry {
+                    registry_id: None,
                     default_mode: None,
                     env: Default::default(),
                     default_config_options: HashMap::default(),
@@ -373,15 +374,23 @@ impl AgentServerStore {
                         ),
                     );
                 }
-                CustomAgentServerSettings::Registry { env, .. } => {
-                    let Some(agent) = registry_agents_by_id.get(name) else {
+                CustomAgentServerSettings::Registry {
+                    registry_id, env, ..
+                } => {
+                    let registry_id = registry_id.as_deref().unwrap_or(name);
+                    let Some(agent) = registry_agents_by_id.get(registry_id) else {
                         if registry_store.is_some() {
-                            log::debug!("Registry agent '{}' not found in ACP registry", name);
+                            log::debug!(
+                                "Registry agent '{}' for configured agent '{}' not found in ACP registry",
+                                registry_id,
+                                name
+                            );
                         }
                         continue;
                     };
 
                     let agent_name = AgentId(name.clone().into());
+                    let display_name = registry_agent_display_name(agent.name(), name, registry_id);
                     match agent {
                         RegistryAgent::Binary(agent) => {
                             if !agent.supports_current_platform {
@@ -400,7 +409,7 @@ impl AgentServerStore {
                                         http_client: http_client.clone(),
                                         node_runtime: node_runtime.clone(),
                                         project_environment: project_environment.clone(),
-                                        registry_id: Arc::from(name.as_str()),
+                                        registry_id: Arc::from(registry_id),
                                         version: agent.metadata.version.clone(),
                                         targets: agent.targets.clone(),
                                         env: env.clone(),
@@ -410,7 +419,7 @@ impl AgentServerStore {
                                         as Box<dyn ExternalAgentServer>,
                                     ExternalAgentSource::Registry,
                                     agent.metadata.icon_path.clone(),
-                                    Some(agent.metadata.name.clone()),
+                                    Some(display_name.clone()),
                                 ),
                             );
                         }
@@ -422,7 +431,7 @@ impl AgentServerStore {
                                         fs: fs.clone(),
                                         node_runtime: node_runtime.clone(),
                                         project_environment: project_environment.clone(),
-                                        registry_id: Arc::from(name.as_str()),
+                                        registry_id: Arc::from(registry_id),
                                         version: agent.metadata.version.clone(),
                                         package: agent.package.clone(),
                                         args: agent.args.clone(),
@@ -433,7 +442,7 @@ impl AgentServerStore {
                                         as Box<dyn ExternalAgentServer>,
                                     ExternalAgentSource::Registry,
                                     agent.metadata.icon_path.clone(),
-                                    Some(agent.metadata.name.clone()),
+                                    Some(display_name),
                                 ),
                             );
                         }
@@ -813,6 +822,18 @@ impl AgentServerStore {
             }
         });
         Ok(())
+    }
+}
+
+fn registry_agent_display_name(
+    registry_name: &SharedString,
+    configured_agent_id: &str,
+    registry_id: &str,
+) -> SharedString {
+    if configured_agent_id == registry_id {
+        registry_name.clone()
+    } else {
+        SharedString::from(format!("{registry_name} ({configured_agent_id})"))
     }
 }
 
@@ -1536,6 +1557,10 @@ pub enum CustomAgentServerSettings {
         favorite_config_option_values: HashMap<String, Vec<String>>,
     },
     Registry {
+        /// The ID of the agent in the ACP registry.
+        ///
+        /// Default: None
+        registry_id: Option<String>,
         /// Additional environment variables to pass to the agent.
         ///
         /// Default: {}
@@ -1626,11 +1651,13 @@ impl From<settings::CustomAgentServerSettings> for CustomAgentServerSettings {
                 favorite_config_option_values,
             },
             settings::CustomAgentServerSettings::Registry {
+                registry_id,
                 env,
                 default_mode,
                 default_config_options,
                 favorite_config_option_values,
             } => CustomAgentServerSettings::Registry {
+                registry_id,
                 env,
                 default_mode,
                 default_config_options,
@@ -1714,6 +1741,7 @@ mod tests {
                             (
                                 name.to_string(),
                                 settings::CustomAgentServerSettings::Registry {
+                                    registry_id: None,
                                     env: HashMap::default(),
                                     default_mode: None,
                                     default_config_options: HashMap::default(),
@@ -1727,6 +1755,16 @@ mod tests {
                 cx,
             );
         });
+    }
+
+    fn make_registry_settings(registry_id: Option<&str>) -> settings::CustomAgentServerSettings {
+        settings::CustomAgentServerSettings::Registry {
+            registry_id: registry_id.map(str::to_string),
+            env: HashMap::default(),
+            default_mode: None,
+            default_config_options: HashMap::default(),
+            favorite_config_option_values: HashMap::default(),
+        }
     }
 
     fn create_agent_server_store(cx: &mut TestAppContext) -> gpui::Entity<AgentServerStore> {
@@ -2062,6 +2100,52 @@ mod tests {
             store.set_agents(vec![make_npx_agent("test-agent", "2.0.0")], cx);
         });
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn test_multiple_configured_instances_can_share_registry_agent(cx: &mut TestAppContext) {
+        init_test_settings(cx);
+        init_registry(cx, vec![make_npx_agent("test-agent", "1.0.0")]);
+        cx.update(|cx| {
+            AllAgentServersSettings::override_global(
+                AllAgentServersSettings(HashMap::from_iter([
+                    (
+                        "test-agent".to_string(),
+                        make_registry_settings(None).into(),
+                    ),
+                    (
+                        "test-agent-2".to_string(),
+                        make_registry_settings(Some("test-agent")).into(),
+                    ),
+                ])),
+                cx,
+            );
+        });
+        let store = create_agent_server_store(cx);
+
+        store.read_with(cx, |store, _| {
+            let primary = store
+                .external_agents
+                .get(&AgentId::new("test-agent"))
+                .expect("primary agent should be registered");
+            let secondary = store
+                .external_agents
+                .get(&AgentId::new("test-agent-2"))
+                .expect("secondary agent should be registered");
+
+            assert_eq!(
+                primary.server.version().map(|version| version.as_ref()),
+                Some("1.0.0")
+            );
+            assert_eq!(
+                secondary.server.version().map(|version| version.as_ref()),
+                Some("1.0.0")
+            );
+            assert_eq!(
+                store.agent_display_name(&AgentId::new("test-agent-2")),
+                Some(SharedString::from("test-agent (test-agent-2)"))
+            );
+        });
     }
 
     #[gpui::test]

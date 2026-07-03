@@ -150,13 +150,52 @@ impl AgentRegistryPage {
         self.installed_statuses.clear();
         for (id, settings) in settings.iter() {
             let status = match settings {
-                CustomAgentServerSettings::Registry { .. } => {
-                    RegistryInstallStatus::InstalledRegistry
+                CustomAgentServerSettings::Registry { registry_id, .. } => {
+                    let registry_id = registry_id.as_deref().unwrap_or(id);
+                    self.installed_statuses.insert(
+                        registry_id.to_string(),
+                        RegistryInstallStatus::InstalledRegistry,
+                    );
+                    continue;
                 }
                 CustomAgentServerSettings::Custom { .. } => RegistryInstallStatus::InstalledCustom,
             };
-            self.installed_statuses.insert(id.clone(), status);
+            self.installed_statuses.entry(id.clone()).or_insert(status);
         }
+    }
+
+    fn add_registry_agent_settings(
+        agent_servers: &mut settings::AllAgentServersSettings,
+        registry_id: &str,
+    ) {
+        let agent_id = if !agent_servers.contains_key(registry_id) {
+            registry_id.to_string()
+        } else {
+            let Some(agent_id) = (2..=u16::MAX)
+                .map(|index| format!("{registry_id}-{index}"))
+                .find(|agent_id| !agent_servers.contains_key(agent_id.as_str()))
+            else {
+                return;
+            };
+            agent_id
+        };
+
+        agent_servers.insert(
+            agent_id.clone(),
+            settings::CustomAgentServerSettings::Registry {
+                registry_id: (agent_id != registry_id).then(|| registry_id.to_string()),
+                default_mode: None,
+                env: Default::default(),
+                default_config_options: HashMap::default(),
+                favorite_config_option_values: HashMap::default(),
+            },
+        );
+    }
+
+    fn has_registry_installation(&self, id: &str) -> bool {
+        self.installed_statuses
+            .get(id)
+            .is_some_and(|status| *status == RegistryInstallStatus::InstalledRegistry)
     }
 
     fn install_status(&self, id: &str) -> RegistryInstallStatus {
@@ -494,66 +533,81 @@ impl AgentRegistryPage {
         install_status: RegistryInstallStatus,
         supports_current_platform: bool,
         cx: &mut Context<Self>,
-    ) -> Button {
+    ) -> AnyElement {
         let button_id = SharedString::from(format!("install-agent-{}", agent.id()));
 
         if !supports_current_platform {
             return Button::new(button_id, "Unavailable")
                 .style(ButtonStyle::OutlinedGhost)
-                .disabled(true);
+                .disabled(true)
+                .into_any_element();
         }
 
         match install_status {
-            RegistryInstallStatus::NotInstalled => {
+            RegistryInstallStatus::NotInstalled | RegistryInstallStatus::InstalledRegistry => {
                 let fs = <dyn Fs>::global(cx);
                 let agent_id = agent.id().to_string();
-                Button::new(button_id, "Install")
-                    .style(ButtonStyle::Tinted(ui::TintColor::Accent))
-                    .start_icon(
-                        Icon::new(IconName::Download)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .on_click(move |_, _, cx| {
+                let has_registry_installation = self.has_registry_installation(agent.id().as_ref());
+
+                let install_button = Button::new(
+                    button_id,
+                    if has_registry_installation {
+                        "Add Another"
+                    } else {
+                        "Install"
+                    },
+                )
+                .style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                .start_icon(
+                    Icon::new(IconName::Download)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+                .on_click({
+                    let fs = fs.clone();
+                    let agent_id = agent_id.clone();
+                    move |_, _, cx| {
                         let agent_id = agent_id.clone();
                         update_settings_file(fs.clone(), cx, move |settings, _| {
                             let agent_servers = settings.agent_servers.get_or_insert_default();
-                            agent_servers.entry(agent_id).or_insert_with(|| {
-                                settings::CustomAgentServerSettings::Registry {
-                                    default_mode: None,
-                                    env: Default::default(),
-                                    default_config_options: HashMap::default(),
-                                    favorite_config_option_values: HashMap::default(),
-                                }
-                            });
+                            Self::add_registry_agent_settings(agent_servers, &agent_id);
                         });
-                    })
-            }
-            RegistryInstallStatus::InstalledRegistry => {
-                let fs = <dyn Fs>::global(cx);
-                let agent_id = agent.id().to_string();
-                Button::new(button_id, "Remove")
-                    .style(ButtonStyle::OutlinedGhost)
-                    .on_click(move |_, _, cx| {
-                        let agent_id = agent_id.clone();
-                        update_settings_file(fs.clone(), cx, move |settings, _| {
-                            let Some(agent_servers) = settings.agent_servers.as_mut() else {
-                                return;
-                            };
-                            if let Some(entry) = agent_servers.get(agent_id.as_str())
-                                && matches!(
-                                    entry,
-                                    settings::CustomAgentServerSettings::Registry { .. }
-                                )
-                            {
-                                agent_servers.remove(agent_id.as_str());
-                            }
-                        });
-                    })
+                    }
+                });
+
+                if !has_registry_installation {
+                    return install_button.into_any_element();
+                }
+
+                let remove_button = Button::new(
+                    SharedString::from(format!("remove-agent-{}", agent.id())),
+                    "Remove",
+                )
+                .style(ButtonStyle::OutlinedGhost)
+                .on_click(move |_, _, cx| {
+                    let agent_id = agent_id.clone();
+                    update_settings_file(fs.clone(), cx, move |settings, _| {
+                        let Some(agent_servers) = settings.agent_servers.as_mut() else {
+                            return;
+                        };
+                        if let Some(entry) = agent_servers.get(agent_id.as_str())
+                            && matches!(entry, settings::CustomAgentServerSettings::Registry { .. })
+                        {
+                            agent_servers.remove(agent_id.as_str());
+                        }
+                    });
+                });
+
+                h_flex()
+                    .gap_1()
+                    .child(remove_button)
+                    .child(install_button)
+                    .into_any_element()
             }
             RegistryInstallStatus::InstalledCustom => Button::new(button_id, "Installed")
                 .style(ButtonStyle::OutlinedGhost)
-                .disabled(true),
+                .disabled(true)
+                .into_any_element(),
         }
     }
 }

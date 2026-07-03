@@ -632,6 +632,7 @@ impl AgentSessionList for AcpSessionList {
 
 pub async fn connect(
     agent_id: AgentId,
+    registry_agent_id: Option<AgentId>,
     project: Entity<Project>,
     command: AgentServerCommand,
     agent_server_store: WeakEntity<AgentServerStore>,
@@ -641,6 +642,7 @@ pub async fn connect(
 ) -> Result<Rc<dyn AgentConnection>> {
     let conn = AcpConnection::stdio(
         agent_id,
+        registry_agent_id,
         project,
         command.clone(),
         agent_server_store,
@@ -804,6 +806,7 @@ impl AcpConnection {
 
     pub async fn stdio(
         agent_id: AgentId,
+        registry_agent_id: Option<AgentId>,
         project: Entity<Project>,
         command: AgentServerCommand,
         agent_server_store: WeakEntity<AgentServerStore>,
@@ -1058,24 +1061,25 @@ impl AcpConnection {
         };
 
         // TODO: Remove this override once Google team releases their official auth methods
-        let auth_methods = if agent_id.0.as_ref() == GEMINI_ID {
-            let mut gemini_args = original_command.args.clone();
-            gemini_args.retain(|a| a != "--experimental-acp" && a != "--acp");
-            let value = serde_json::json!({
-                "label": "gemini /auth",
-                "command": original_command.path.to_string_lossy(),
-                "args": gemini_args,
-                "env": original_command.env.unwrap_or_default(),
-            });
-            let meta = acp::Meta::from_iter([("terminal-auth".to_string(), value)]);
-            vec![acp::AuthMethod::Agent(
-                acp::AuthMethodAgent::new(GEMINI_TERMINAL_AUTH_METHOD_ID, "Login")
-                    .description("Login with your Google or Vertex AI account")
-                    .meta(meta),
-            )]
-        } else {
-            response.auth_methods
-        };
+        let auth_methods =
+            if registry_agent_id.as_ref().unwrap_or(&agent_id).0.as_ref() == GEMINI_ID {
+                let mut gemini_args = original_command.args.clone();
+                gemini_args.retain(|a| a != "--experimental-acp" && a != "--acp");
+                let value = serde_json::json!({
+                    "label": "gemini /auth",
+                    "command": original_command.path.to_string_lossy(),
+                    "args": gemini_args,
+                    "env": original_command.env.unwrap_or_default(),
+                });
+                let meta = acp::Meta::from_iter([("terminal-auth".to_string(), value)]);
+                vec![acp::AuthMethod::Agent(
+                    acp::AuthMethodAgent::new(GEMINI_TERMINAL_AUTH_METHOD_ID, "Login")
+                        .description("Login with your Google or Vertex AI account")
+                        .meta(meta),
+                )]
+            } else {
+                response.auth_methods
+            };
         let defaults = AcpConnectionDefaults::new(default_mode, default_config_options);
         let settings_subscription = cx.update({
             let agent_id = agent_id.clone();
@@ -3808,6 +3812,7 @@ mod tests {
         let mut async_cx = cx.to_async();
         let startup = AcpConnection::stdio(
             AgentId::new("test-agent"),
+            None,
             project,
             command,
             agent_server_store,

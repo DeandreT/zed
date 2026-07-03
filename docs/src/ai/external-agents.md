@@ -147,6 +147,25 @@ Open [Agent Settings](./agent-settings.md), go to the **External Agents** page, 
 
 Registry-installed agents can also have per-agent settings under `agent_servers.<agent-id>`.
 
+## Multiple Instances of the Same Agent {#multiple-instances}
+
+To use multiple accounts for the same registry agent, add multiple entries with distinct names and set `registry_id` to the registry agent you want to run:
+
+```json [settings]
+{
+  "agent_servers": {
+    "claude-enterprise": {
+      "type": "registry",
+      "registry_id": "claude-acp"
+    },
+    "claude-max": {
+      "type": "registry",
+      "registry_id": "claude-acp"
+    }
+  }
+}
+```
+
 ## Extension-Provided Agents {#extension-agents}
 
 Extension-provided agents are deprecated. The [ACP Registry](#registry) is now the way to install agents, and previously installed extension agents are automatically migrated to their registry equivalents.

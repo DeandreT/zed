@@ -752,6 +752,13 @@ pub enum CustomAgentServerSettings {
     // Used for the ACP extension migration
     #[serde(alias = "extension")]
     Registry {
+        /// The ID of the agent in the ACP registry.
+        ///
+        /// When omitted, the settings key is used. Set this when creating
+        /// multiple configured instances of the same registry agent.
+        ///
+        /// Default: None
+        registry_id: Option<String>,
         /// Additional environment variables to pass to the agent.
         ///
         /// Default: {}

@@ -198,7 +198,8 @@ impl AgentServer for CustomAgentServer {
     ) -> Task<Result<Rc<dyn AgentConnection>>> {
         let agent_id = self.agent_id();
         let default_mode = self.default_mode(cx);
-        let is_registry_agent = is_registry_agent(agent_id.clone(), cx);
+        let registry_id = registry_id_for_agent(agent_id.clone(), cx);
+        let is_registry_agent = registry_id.is_some();
         let default_config_options = cx.read_global(|settings: &SettingsStore, _| {
             settings
                 .get::<AllAgentServersSettings>(None)
@@ -226,8 +227,8 @@ impl AgentServer for CustomAgentServer {
         if delegate.store.read(cx).no_browser() {
             extra_env.insert("NO_BROWSER".to_owned(), "1".to_owned());
         }
-        if is_registry_agent {
-            match agent_id.as_ref() {
+        if let Some(registry_id) = registry_id.as_ref() {
+            match registry_id.as_ref() {
                 CLAUDE_AGENT_ID => {
                     extra_env.insert("ANTHROPIC_API_KEY".into(), "".into());
                 }
@@ -247,7 +248,10 @@ impl AgentServer for CustomAgentServer {
         }
         let store = delegate.store.downgrade();
         cx.spawn(async move |cx| {
-            if is_registry_agent && agent_id.as_ref() == GEMINI_ID {
+            if registry_id
+                .as_ref()
+                .is_some_and(|id| id.as_ref() == GEMINI_ID)
+            {
                 if let Some(api_key) = cx.update(api_key_for_gemini_cli).await.ok() {
                     extra_env.insert("GEMINI_API_KEY".into(), api_key);
                 }
@@ -268,6 +272,7 @@ impl AgentServer for CustomAgentServer {
                 .await?;
             let connection = crate::acp::connect(
                 agent_id,
+                registry_id,
                 project,
                 command,
                 store.clone(),
@@ -302,27 +307,50 @@ fn api_key_for_gemini_cli(cx: &mut App) -> Task<Result<String>> {
     })
 }
 
+#[cfg(test)]
 fn is_registry_agent(agent_id: impl Into<AgentId>, cx: &App) -> bool {
+    registry_id_for_agent(agent_id, cx).is_some()
+}
+
+fn registry_id_for_agent(agent_id: impl Into<AgentId>, cx: &App) -> Option<AgentId> {
     let agent_id = agent_id.into();
-    let is_in_registry = project::AgentRegistryStore::try_global(cx)
-        .map(|store| store.read(cx).agent(&agent_id).is_some())
-        .unwrap_or(false);
-    let is_settings_registry = cx.read_global(|settings: &SettingsStore, _| {
+    let settings_registry_id = cx.read_global(|settings: &SettingsStore, _| {
         settings
             .get::<AllAgentServersSettings>(None)
             .get(agent_id.as_ref())
-            .is_some_and(|s| {
-                matches!(
-                    s,
-                    project::agent_server_store::CustomAgentServerSettings::Registry { .. }
-                )
+            .and_then(|s| {
+                if let project::agent_server_store::CustomAgentServerSettings::Registry {
+                    registry_id,
+                    ..
+                } = s
+                {
+                    Some(AgentId::new(
+                        registry_id
+                            .as_deref()
+                            .unwrap_or_else(|| agent_id.as_ref())
+                            .to_string(),
+                    ))
+                } else {
+                    None
+                }
             })
     });
-    is_in_registry || is_settings_registry
+    if settings_registry_id.is_some() {
+        return settings_registry_id;
+    }
+
+    project::AgentRegistryStore::try_global(cx).and_then(|store| {
+        store
+            .read(cx)
+            .agent(&agent_id)
+            .is_some()
+            .then_some(agent_id)
+    })
 }
 
 fn default_settings_for_agent() -> settings::CustomAgentServerSettings {
     settings::CustomAgentServerSettings::Registry {
+        registry_id: None,
         default_mode: None,
         env: Default::default(),
         default_config_options: Default::default(),
@@ -417,6 +445,7 @@ mod tests {
             vec![(
                 "agent-from-settings",
                 settings::CustomAgentServerSettings::Registry {
+                    registry_id: None,
                     env: HashMap::default(),
                     default_mode: None,
                     default_config_options: HashMap::default(),
@@ -426,6 +455,31 @@ mod tests {
         );
         cx.update(|cx| {
             assert!(is_registry_agent("agent-from-settings", cx));
+        });
+    }
+
+    #[gpui::test]
+    fn test_registry_instance_uses_configured_registry_id(cx: &mut TestAppContext) {
+        init_test(cx);
+        set_agent_server_settings(
+            cx,
+            vec![(
+                "agent-account",
+                settings::CustomAgentServerSettings::Registry {
+                    registry_id: Some("agent-from-registry".to_string()),
+                    env: HashMap::default(),
+                    default_mode: None,
+                    default_config_options: HashMap::default(),
+                    favorite_config_option_values: HashMap::default(),
+                },
+            )],
+        );
+        cx.update(|cx| {
+            assert!(is_registry_agent("agent-account", cx));
+            assert_eq!(
+                registry_id_for_agent("agent-account", cx),
+                Some(AgentId::new("agent-from-registry"))
+            );
         });
     }
 }
