@@ -60,8 +60,8 @@ use crate::components::{
     text_field_a11y_state, theme_picker,
 };
 use crate::pages::{
-    CustomAgentForm, LlmProviderForm, McpServerForm, render_input_audio_device_dropdown,
-    render_output_audio_device_dropdown,
+    AgentEnvSecretsForm, AgentRenameForm, CustomAgentForm, LlmProviderForm, McpServerForm,
+    render_input_audio_device_dropdown, render_output_audio_device_dropdown,
 };
 
 const NAVBAR_CONTAINER_TAB_INDEX: isize = 0;
@@ -970,6 +970,10 @@ pub struct SettingsWindow {
     pub(crate) mcp_add_server_focus_handle: FocusHandle,
     /// State for the active "add/edit custom external agent" form sub-page, if open.
     pub(crate) custom_agent_form: Option<CustomAgentForm>,
+    /// State for the active "rename external agent" form sub-page, if open.
+    pub(crate) agent_rename_form: Option<AgentRenameForm>,
+    /// State for the active "external agent environment secrets" form sub-page, if open.
+    pub(crate) agent_env_secrets_form: Option<AgentEnvSecretsForm>,
     /// Stable focus handle for the external agents "Add Agent" button, so it can
     /// show a focus ring when the page auto-focuses it on open (which happens via
     /// mouse, where `focus_visible` styling would otherwise be suppressed).
@@ -1993,6 +1997,8 @@ impl SettingsWindow {
             mcp_server_form: None,
             mcp_add_server_focus_handle: cx.focus_handle(),
             custom_agent_form: None,
+            agent_rename_form: None,
+            agent_env_secrets_form: None,
             external_agent_add_focus_handle: cx.focus_handle(),
             skill_creator_page: None,
         };
@@ -5288,6 +5294,8 @@ pub mod test {
                 mcp_server_form: None,
                 mcp_add_server_focus_handle: cx.focus_handle(),
                 custom_agent_form: None,
+            agent_rename_form: None,
+            agent_env_secrets_form: None,
                 external_agent_add_focus_handle: cx.focus_handle(),
                 skill_creator_page: None,
             }
@@ -5427,6 +5435,8 @@ pub mod test {
             mcp_server_form: None,
             mcp_add_server_focus_handle: cx.focus_handle(),
             custom_agent_form: None,
+            agent_rename_form: None,
+            agent_env_secrets_form: None,
             external_agent_add_focus_handle: cx.focus_handle(),
             skill_creator_page: None,
         };

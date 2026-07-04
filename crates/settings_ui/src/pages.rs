@@ -16,7 +16,8 @@ pub(crate) use audio_input_output_setup::{
 pub(crate) use audio_test_window::open_audio_test_window;
 pub(crate) use edit_prediction_provider_setup::render_edit_prediction_setup_page;
 pub(crate) use external_agents_page::{
-    CustomAgentForm, render_add_agent_popover, render_external_agents_page,
+    AgentEnvSecretsForm, AgentRenameForm, CustomAgentForm, render_add_agent_popover,
+    render_external_agents_page,
 };
 pub(crate) use feature_flags::render_feature_flags_page;
 pub(crate) use llm_providers_page::{

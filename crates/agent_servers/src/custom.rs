@@ -2,7 +2,7 @@ use crate::{AgentServer, AgentServerDelegate, load_proxy_env};
 use acp_thread::AgentConnection;
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Context as _, Result};
-use collections::HashSet;
+use collections::{HashMap, HashSet};
 use fs::Fs;
 use gpui::{App, AppContext as _, Entity, Task};
 use language_model::{ApiKey, EnvVar};
@@ -13,6 +13,7 @@ use project::{
 use settings::{AgentConfigOptionValue, SettingsStore, update_settings_file};
 use std::{rc::Rc, sync::Arc};
 use ui::IconName;
+use util::ResultExt as _;
 
 pub const GEMINI_ID: &str = "gemini";
 pub const CLAUDE_AGENT_ID: &str = "claude-acp";
@@ -256,6 +257,14 @@ impl AgentServer for CustomAgentServer {
                     extra_env.insert("GEMINI_API_KEY".into(), api_key);
                 }
             }
+            // A keychain failure shouldn't prevent the agent from launching.
+            if let Some(env_secrets) = cx
+                .update(|cx| load_agent_env_secrets(&agent_id, cx))
+                .await
+                .log_err()
+            {
+                extra_env.extend(env_secrets);
+            }
             let command = store
                 .update(cx, |store, cx| {
                     let agent = store.get_external_agent(&agent_id).with_context(|| {
@@ -307,6 +316,58 @@ fn api_key_for_gemini_cli(cx: &mut App) -> Task<Result<String>> {
     })
 }
 
+const AGENT_ENV_SECRETS_USERNAME: &str = "env";
+
+fn agent_env_secrets_key(agent_id: &AgentId) -> String {
+    format!("zed_external_agent_env:{agent_id}")
+}
+
+fn serialize_agent_env_secrets(secrets: &HashMap<String, String>) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec(secrets)?)
+}
+
+fn deserialize_agent_env_secrets(bytes: &[u8]) -> Result<HashMap<String, String>> {
+    Ok(serde_json::from_slice(bytes)?)
+}
+
+/// Loads the secret environment variables configured for an agent from the
+/// system keychain. Returns an empty map when none are stored.
+pub fn load_agent_env_secrets(
+    agent_id: &AgentId,
+    cx: &App,
+) -> Task<Result<HashMap<String, String>>> {
+    let credentials_provider = zed_credentials_provider::global(cx);
+    let key = agent_env_secrets_key(agent_id);
+    cx.spawn(async move |cx| {
+        let Some((_, secrets)) = credentials_provider.read_credentials(&key, cx).await? else {
+            return Ok(HashMap::default());
+        };
+        deserialize_agent_env_secrets(&secrets)
+    })
+}
+
+/// Stores the secret environment variables for an agent in the system
+/// keychain, replacing any previously stored set. An empty map deletes the
+/// keychain entry.
+pub fn save_agent_env_secrets(
+    agent_id: &AgentId,
+    secrets: HashMap<String, String>,
+    cx: &App,
+) -> Task<Result<()>> {
+    let credentials_provider = zed_credentials_provider::global(cx);
+    let key = agent_env_secrets_key(agent_id);
+    cx.spawn(async move |cx| {
+        if secrets.is_empty() {
+            credentials_provider.delete_credentials(&key, cx).await
+        } else {
+            let secrets = serialize_agent_env_secrets(&secrets)?;
+            credentials_provider
+                .write_credentials(&key, AGENT_ENV_SECRETS_USERNAME, &secrets, cx)
+                .await
+        }
+    })
+}
+
 #[cfg(test)]
 fn is_registry_agent(agent_id: impl Into<AgentId>, cx: &App) -> bool {
     registry_id_for_agent(agent_id, cx).is_some()
@@ -351,6 +412,7 @@ fn registry_id_for_agent(agent_id: impl Into<AgentId>, cx: &App) -> Option<Agent
 fn default_settings_for_agent() -> settings::CustomAgentServerSettings {
     settings::CustomAgentServerSettings::Registry {
         registry_id: None,
+        display_name: None,
         default_mode: None,
         env: Default::default(),
         default_config_options: Default::default(),
@@ -446,6 +508,7 @@ mod tests {
                 "agent-from-settings",
                 settings::CustomAgentServerSettings::Registry {
                     registry_id: None,
+                    display_name: None,
                     env: HashMap::default(),
                     default_mode: None,
                     default_config_options: HashMap::default(),
@@ -467,6 +530,7 @@ mod tests {
                 "agent-account",
                 settings::CustomAgentServerSettings::Registry {
                     registry_id: Some("agent-from-registry".to_string()),
+                    display_name: None,
                     env: HashMap::default(),
                     default_mode: None,
                     default_config_options: HashMap::default(),
@@ -481,5 +545,110 @@ mod tests {
                 Some(AgentId::new("agent-from-registry"))
             );
         });
+    }
+
+    #[test]
+    fn test_agent_env_secrets_round_trip() {
+        let secrets = HashMap::from_iter([
+            (
+                "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+                "sk-ant-oat01-test".to_string(),
+            ),
+            ("ANTHROPIC_API_KEY".to_string(), "sk-ant-test".to_string()),
+        ]);
+        let bytes = serialize_agent_env_secrets(&secrets).expect("serialization should succeed");
+        assert_eq!(
+            deserialize_agent_env_secrets(&bytes).expect("deserialization should succeed"),
+            secrets
+        );
+
+        let empty = HashMap::default();
+        let bytes = serialize_agent_env_secrets(&empty).expect("serialization should succeed");
+        assert_eq!(
+            deserialize_agent_env_secrets(&bytes).expect("deserialization should succeed"),
+            empty
+        );
+    }
+
+    #[derive(Default)]
+    struct FakeCredentialsProvider(std::sync::Mutex<HashMap<String, Vec<u8>>>);
+
+    impl credentials_provider::CredentialsProvider for FakeCredentialsProvider {
+        fn read_credentials<'a>(
+            &'a self,
+            url: &'a str,
+            _cx: &'a gpui::AsyncApp,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<Option<(String, Vec<u8>)>>> + 'a>>
+        {
+            let value = self.0.lock().expect("lock poisoned").get(url).cloned();
+            Box::pin(async move {
+                Ok(value.map(|password| (AGENT_ENV_SECRETS_USERNAME.to_string(), password)))
+            })
+        }
+
+        fn write_credentials<'a>(
+            &'a self,
+            url: &'a str,
+            _username: &'a str,
+            password: &'a [u8],
+            _cx: &'a gpui::AsyncApp,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+            self.0
+                .lock()
+                .expect("lock poisoned")
+                .insert(url.to_string(), password.to_vec());
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn delete_credentials<'a>(
+            &'a self,
+            url: &'a str,
+            _cx: &'a gpui::AsyncApp,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+            self.0.lock().expect("lock poisoned").remove(url);
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    #[gpui::test]
+    async fn test_agent_env_secrets_keychain_storage(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            cx.set_global(zed_credentials_provider::ZedCredentialsProvider(Arc::new(
+                FakeCredentialsProvider::default(),
+            )))
+        });
+
+        let work = AgentId::new("claude-work");
+        let personal = AgentId::new("claude-personal");
+        let secrets = HashMap::from_iter([(
+            "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+            "sk-ant-oat01-test".to_string(),
+        )]);
+
+        cx.update(|cx| save_agent_env_secrets(&work, secrets.clone(), cx))
+            .await
+            .expect("saving secrets should succeed");
+
+        let loaded = cx
+            .update(|cx| load_agent_env_secrets(&work, cx))
+            .await
+            .expect("loading secrets should succeed");
+        assert_eq!(loaded, secrets);
+
+        let other_agent = cx
+            .update(|cx| load_agent_env_secrets(&personal, cx))
+            .await
+            .expect("loading secrets should succeed");
+        assert!(other_agent.is_empty());
+
+        cx.update(|cx| save_agent_env_secrets(&work, HashMap::default(), cx))
+            .await
+            .expect("deleting secrets should succeed");
+        let loaded = cx
+            .update(|cx| load_agent_env_secrets(&work, cx))
+            .await
+            .expect("loading secrets should succeed");
+        assert!(loaded.is_empty());
     }
 }

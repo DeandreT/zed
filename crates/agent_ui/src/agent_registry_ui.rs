@@ -184,6 +184,7 @@ impl AgentRegistryPage {
             agent_id.clone(),
             settings::CustomAgentServerSettings::Registry {
                 registry_id: (agent_id != registry_id).then(|| registry_id.to_string()),
+                display_name: None,
                 default_mode: None,
                 env: Default::default(),
                 default_config_options: HashMap::default(),

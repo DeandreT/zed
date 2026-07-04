@@ -4,7 +4,7 @@ use anyhow::Result;
 use collections::HashMap;
 use editor::{Editor, MultiBufferOffset, SelectionEffects, scroll::Autoscroll};
 use gpui::{
-    AsyncWindowContext, Entity, FocusHandle, Focusable as _, ReadGlobal as _, ScrollHandle,
+    AsyncWindowContext, Entity, FocusHandle, Focusable as _, ReadGlobal as _, ScrollHandle, Task,
     WeakEntity, WindowHandle, prelude::*,
 };
 use itertools::Itertools as _;
@@ -178,6 +178,33 @@ fn render_agent(
         ExternalAgentSource::Custom => AiSettingItemSource::Custom,
     };
 
+    let rename_button = IconButton::new(format!("rename-{}", id_string), IconName::Pencil)
+        .icon_color(Color::Muted)
+        .icon_size(IconSize::Small)
+        .size(ButtonSize::Medium)
+        .tab_index(0isize)
+        .tooltip(Tooltip::text("Rename Agent"))
+        .on_click(cx.listener({
+            let id = id.clone();
+            let display_name = display_name.clone();
+            move |this, _event, window, cx| {
+                open_agent_rename_form(this, id.clone(), display_name.clone(), window, cx);
+            }
+        }));
+
+    let env_secrets_button = IconButton::new(format!("env-secrets-{}", id_string), IconName::Lock)
+    .icon_color(Color::Muted)
+    .icon_size(IconSize::Small)
+    .size(ButtonSize::Medium)
+    .tab_index(0isize)
+    .tooltip(Tooltip::text("Configure Environment Secrets"))
+    .on_click(cx.listener({
+        let id = id.clone();
+        move |this, _event, window, cx| {
+            open_agent_env_secrets_form(this, id.clone(), window, cx);
+        }
+    }));
+
     // Only custom agents are editable here; registry agents are managed via the
     // ACP registry and only support removal.
     let configure_button = (source == ExternalAgentSource::Custom).then(|| {
@@ -223,12 +250,15 @@ fn render_agent(
         source_kind,
     )
     .icon(icon)
+    .action(rename_button)
+    .action(env_secrets_button)
     .when_some(configure_button, |this, button| this.action(button))
     .action(remove_button)
 }
 
 fn remove_agent(id: &AgentId, source: ExternalAgentSource, cx: &mut App) {
     let fs = <dyn fs::Fs>::global(cx);
+    agent_servers::save_agent_env_secrets(id, HashMap::default(), cx).detach_and_log_err(cx);
     let id = id.clone();
     update_settings_file(fs, cx, move |settings, _| {
         let Some(agent_servers) = settings.agent_servers.as_mut() else {
@@ -346,6 +376,7 @@ pub(crate) struct CustomAgentForm {
     env: Vec<KeyValueRow>,
     /// Advanced fields not surfaced by the form. They're preserved verbatim so
     /// editing the basic settings doesn't drop a user's hand-written config.
+    display_name: Option<String>,
     default_mode: Option<String>,
     default_config_options: HashMap<String, AgentConfigOptionValue>,
     favorite_config_option_values: HashMap<String, Vec<String>>,
@@ -369,6 +400,7 @@ impl CustomAgentForm {
         let mut command_initial = None;
         let mut args_initial = None;
         let mut env = Vec::new();
+        let mut display_name = None;
         let mut default_mode = None;
         let mut default_config_options = HashMap::default();
         let mut favorite_config_option_values = HashMap::default();
@@ -378,6 +410,7 @@ impl CustomAgentForm {
         if let Some((_, settings)) = existing.as_ref() {
             match settings {
                 CustomAgentServerSettings::Custom {
+                    display_name: custom_display_name,
                     path,
                     args,
                     env: env_map,
@@ -392,12 +425,14 @@ impl CustomAgentForm {
                     for (key, value) in sorted_pairs(env_map) {
                         env.push(new_kv_row(Some(&key), Some(&value), window, cx));
                     }
+                    display_name = custom_display_name.clone();
                     default_mode = mode.clone();
                     default_config_options = config_options.clone();
                     favorite_config_option_values = favorites.clone();
                 }
                 CustomAgentServerSettings::Registry {
                     registry_id: _,
+                    display_name: custom_display_name,
                     env: env_map,
                     default_mode: mode,
                     default_config_options: config_options,
@@ -406,6 +441,7 @@ impl CustomAgentForm {
                     for (key, value) in sorted_pairs(env_map) {
                         env.push(new_kv_row(Some(&key), Some(&value), window, cx));
                     }
+                    display_name = custom_display_name.clone();
                     default_mode = mode.clone();
                     default_config_options = config_options.clone();
                     favorite_config_option_values = favorites.clone();
@@ -419,6 +455,7 @@ impl CustomAgentForm {
             command: new_input("/path/to/agent", command_initial.as_deref(), window, cx),
             args: new_input("--flag value", args_initial.as_deref(), window, cx),
             env,
+            display_name,
             default_mode,
             default_config_options,
             favorite_config_option_values,
@@ -785,6 +822,438 @@ fn save_custom_agent_form(
     settings_window.pop_sub_page(window, cx);
 }
 
+/// Editor-backed state for the "rename external agent" sub-page.
+pub(crate) struct AgentRenameForm {
+    id: AgentId,
+    /// The name shown when the form was opened, so confirming it unchanged
+    /// doesn't persist a derived name (like the registry default) to settings.
+    current_name: SharedString,
+    name: Entity<Editor>,
+    cancel_focus_handle: FocusHandle,
+    save_focus_handle: FocusHandle,
+}
+
+fn open_agent_rename_form(
+    settings_window: &mut SettingsWindow,
+    id: AgentId,
+    current_name: SharedString,
+    window: &mut Window,
+    cx: &mut Context<SettingsWindow>,
+) {
+    settings_window.agent_rename_form = Some(AgentRenameForm {
+        name: new_input("Agent name", Some(current_name.as_ref()), window, cx),
+        id,
+        current_name,
+        cancel_focus_handle: cx.focus_handle(),
+        save_focus_handle: cx.focus_handle(),
+    });
+
+    settings_window.push_dynamic_sub_page(
+        "Rename Agent",
+        "Agent Configuration",
+        Some("agent_servers"),
+        false,
+        render_agent_rename_page,
+        window,
+        cx,
+    );
+}
+
+fn render_agent_rename_page(
+    settings_window: &SettingsWindow,
+    scroll_handle: &ScrollHandle,
+    window: &mut Window,
+    cx: &mut Context<SettingsWindow>,
+) -> AnyElement {
+    let Some(form) = settings_window.agent_rename_form.as_ref() else {
+        return div().into_any_element();
+    };
+
+    let fields = v_flex()
+        .w_full()
+        .gap_4()
+        .child(
+            crate::render_settings_item_layout(
+                settings_window,
+                "Display Name",
+                "Shown in the UI in place of the default name. Leave empty to restore the \
+                 default name.",
+                input_box(&form.name, cx).into_any_element(),
+                None,
+                None,
+                None,
+                false,
+                cx,
+            )
+            .into_any_element(),
+        )
+        .child(render_two_button_actions(
+            "agent-rename-form",
+            &form.cancel_focus_handle,
+            &form.save_focus_handle,
+            |this, window, cx| {
+                this.agent_rename_form = None;
+                this.pop_sub_page(window, cx);
+            },
+            save_agent_rename_form,
+            window,
+            cx,
+        ));
+
+    v_flex()
+        .id("agent-rename-form-page")
+        .size_full()
+        .pt_2p5()
+        .px_8()
+        .pb_16()
+        .track_scroll(scroll_handle)
+        .overflow_y_scroll()
+        .child(fields)
+        .into_any_element()
+}
+
+fn save_agent_rename_form(
+    settings_window: &mut SettingsWindow,
+    window: &mut Window,
+    cx: &mut Context<SettingsWindow>,
+) {
+    let Some(form) = settings_window.agent_rename_form.as_ref() else {
+        return;
+    };
+    let id = form.id.clone();
+    let new_name = form.name.read(cx).text(cx).trim().to_string();
+
+    if new_name != form.current_name.as_ref() {
+        let fs = <dyn fs::Fs>::global(cx);
+        update_settings_file(fs, cx, move |settings, _| {
+            let Some(agent_servers) = settings.agent_servers.as_mut() else {
+                return;
+            };
+            let Some(entry) = agent_servers.get_mut(id.0.as_ref()) else {
+                return;
+            };
+            match entry {
+                CustomAgentServerSettings::Custom { display_name, .. }
+                | CustomAgentServerSettings::Registry { display_name, .. } => {
+                    *display_name = (!new_name.is_empty()).then_some(new_name);
+                }
+            }
+        });
+    }
+
+    settings_window.agent_rename_form = None;
+    settings_window.pop_sub_page(window, cx);
+}
+
+/// Editor-backed state for the "external agent environment secrets" sub-page.
+pub(crate) struct AgentEnvSecretsForm {
+    id: AgentId,
+    /// `None` while the keychain read is in flight.
+    secrets: Option<HashMap<String, String>>,
+    name: Entity<Editor>,
+    value: Entity<Editor>,
+    error: Option<SharedString>,
+    cancel_focus_handle: FocusHandle,
+    save_focus_handle: FocusHandle,
+    _load_task: Task<()>,
+}
+
+fn open_agent_env_secrets_form(
+    settings_window: &mut SettingsWindow,
+    id: AgentId,
+    window: &mut Window,
+    cx: &mut Context<SettingsWindow>,
+) {
+    let load = agent_servers::load_agent_env_secrets(&id, cx);
+    let load_task = cx.spawn(async move |this, cx| {
+        let result = load.await;
+        this.update(cx, |this: &mut SettingsWindow, cx| {
+            if let Some(form) = this.agent_env_secrets_form.as_mut() {
+                match result {
+                    Ok(secrets) => form.secrets = Some(secrets),
+                    Err(error) => form.error = Some(error.to_string().into()),
+                }
+            }
+            cx.notify();
+        })
+        .ok();
+    });
+
+    let value = cx.new(|cx| {
+        let mut editor = Editor::single_line(window, cx);
+        editor.set_placeholder_text("Value", window, cx);
+        editor.set_masked(true, cx);
+        editor
+    });
+
+    settings_window.agent_env_secrets_form = Some(AgentEnvSecretsForm {
+        name: new_input("VARIABLE_NAME", None, window, cx),
+        value,
+        id,
+        secrets: None,
+        error: None,
+        cancel_focus_handle: cx.focus_handle(),
+        save_focus_handle: cx.focus_handle(),
+        _load_task: load_task,
+    });
+
+    settings_window.push_dynamic_sub_page(
+        "Environment Secrets",
+        "Agent Configuration",
+        None,
+        false,
+        render_agent_env_secrets_page,
+        window,
+        cx,
+    );
+}
+
+fn render_agent_env_secrets_page(
+    settings_window: &SettingsWindow,
+    scroll_handle: &ScrollHandle,
+    window: &mut Window,
+    cx: &mut Context<SettingsWindow>,
+) -> AnyElement {
+    let Some(form) = settings_window.agent_env_secrets_form.as_ref() else {
+        return div().into_any_element();
+    };
+    let error = form.error.clone();
+
+    let existing = v_flex().min_w_64().gap_1().map(|this| match &form.secrets {
+        None => this.child(
+            Label::new("Loading…")
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+        ),
+        Some(secrets) if secrets.is_empty() => this.child(
+            Label::new("No secrets configured for this agent.")
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+        ),
+        Some(secrets) => this.children(secrets.keys().sorted_unstable().enumerate().map(
+            |(ix, name)| {
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .child(Label::new(name.clone()).size(LabelSize::Small).truncate())
+                    .child(
+                        IconButton::new(("agent-env-secret-remove", ix), IconName::Trash)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
+                            .tab_index(0isize)
+                            .tooltip(Tooltip::text("Remove Secret"))
+                            .on_click(cx.listener({
+                                let name = name.clone();
+                                move |this, _, _window, cx| {
+                                    remove_agent_env_secret(this, &name, cx);
+                                }
+                            })),
+                    )
+            },
+        )),
+    });
+
+    let fields = v_flex()
+        .w_full()
+        .gap_4()
+        .child(
+            crate::render_settings_item_layout(
+                settings_window,
+                "Secrets",
+                "Secret environment variables passed to this agent. Values are stored in your \
+                 system keychain, never in settings.json.",
+                existing.into_any_element(),
+                None,
+                None,
+                None,
+                false,
+                cx,
+            )
+            .into_any_element(),
+        )
+        .child(
+            crate::render_settings_item_layout(
+                settings_window,
+                "Add Secret",
+                "The variable name and the secret value to pass to the agent process.",
+                v_flex()
+                    .min_w_64()
+                    .gap_1()
+                    .child(input_box(&form.name, cx))
+                    .child(input_box(&form.value, cx))
+                    .into_any_element(),
+                None,
+                None,
+                None,
+                false,
+                cx,
+            )
+            .into_any_element(),
+        )
+        .when_some(error, |this, error| this.child(render_form_error(error)))
+        .child(render_two_button_actions(
+            "agent-env-secrets-form",
+            &form.cancel_focus_handle,
+            &form.save_focus_handle,
+            |this, window, cx| {
+                this.agent_env_secrets_form = None;
+                this.pop_sub_page(window, cx);
+            },
+            save_agent_env_secrets_form,
+            window,
+            cx,
+        ));
+
+    v_flex()
+        .id("agent-env-secrets-form-page")
+        .size_full()
+        .pt_2p5()
+        .px_8()
+        .pb_16()
+        .track_scroll(scroll_handle)
+        .overflow_y_scroll()
+        .child(fields)
+        .into_any_element()
+}
+
+fn remove_agent_env_secret(
+    settings_window: &mut SettingsWindow,
+    name: &str,
+    cx: &mut Context<SettingsWindow>,
+) {
+    let Some(form) = settings_window.agent_env_secrets_form.as_ref() else {
+        return;
+    };
+    let Some(mut secrets) = form.secrets.clone() else {
+        return;
+    };
+    if secrets.remove(name).is_none() {
+        return;
+    }
+
+    let id = form.id.clone();
+    let save = agent_servers::save_agent_env_secrets(&id, secrets.clone(), cx);
+    cx.spawn(async move |this, cx| {
+        let result = save.await;
+        this.update(cx, |this: &mut SettingsWindow, cx| {
+            if let Some(form) = this.agent_env_secrets_form.as_mut() {
+                match result {
+                    Ok(()) => {
+                        form.secrets = Some(secrets);
+                        form.error = None;
+                    }
+                    Err(error) => form.error = Some(error.to_string().into()),
+                }
+            }
+            cx.notify();
+        })
+        .ok();
+    })
+    .detach();
+}
+
+fn save_agent_env_secrets_form(
+    settings_window: &mut SettingsWindow,
+    window: &mut Window,
+    cx: &mut Context<SettingsWindow>,
+) {
+    let Some(form) = settings_window.agent_env_secrets_form.as_ref() else {
+        return;
+    };
+    let Some(secrets) = form.secrets.clone() else {
+        return;
+    };
+    let name = form.name.read(cx).text(cx).trim().to_string();
+    let value = form.value.read(cx).text(cx);
+
+    if name.is_empty() && value.is_empty() {
+        settings_window.agent_env_secrets_form = None;
+        settings_window.pop_sub_page(window, cx);
+        return;
+    }
+    if name.is_empty() || value.is_empty() {
+        if let Some(form) = settings_window.agent_env_secrets_form.as_mut() {
+            form.error = Some("Both a name and a value are required.".into());
+        }
+        cx.notify();
+        return;
+    }
+
+    let mut secrets = secrets;
+    secrets.insert(name, value);
+    let id = form.id.clone();
+    let save = agent_servers::save_agent_env_secrets(&id, secrets, cx);
+    cx.spawn_in(window, async move |this, cx| {
+        let result = save.await;
+        this.update_in(cx, |this, window, cx| {
+            match result {
+                Ok(()) => {
+                    this.agent_env_secrets_form = None;
+                    this.pop_sub_page(window, cx);
+                }
+                Err(error) => {
+                    if let Some(form) = this.agent_env_secrets_form.as_mut() {
+                        form.error = Some(error.to_string().into());
+                    }
+                }
+            }
+            cx.notify();
+        })
+        .ok();
+    })
+    .detach();
+}
+
+/// Renders a Cancel/Save action row shared by the small agent form sub-pages.
+fn render_two_button_actions(
+    id_prefix: &'static str,
+    cancel_focus_handle: &FocusHandle,
+    save_focus_handle: &FocusHandle,
+    on_cancel: fn(&mut SettingsWindow, &mut Window, &mut Context<SettingsWindow>),
+    on_save: fn(&mut SettingsWindow, &mut Window, &mut Context<SettingsWindow>),
+    window: &mut Window,
+    cx: &mut Context<SettingsWindow>,
+) -> impl IntoElement {
+    let cancel_handle = cancel_focus_handle.clone().tab_index(0).tab_stop(true);
+    let save_handle = save_focus_handle.clone().tab_index(0).tab_stop(true);
+    let cancel_border = focus_ring_color(&cancel_handle, window, cx);
+    let save_border = focus_ring_color(&save_handle, window, cx);
+
+    h_flex()
+        .w_full()
+        .gap_2()
+        .justify_end()
+        .pt_2()
+        .child(
+            div()
+                .rounded_md()
+                .border_1()
+                .border_color(cancel_border)
+                .child(
+                    Button::new(SharedString::from(format!("{id_prefix}-cancel")), "Cancel")
+                        .style(ButtonStyle::Subtle)
+                        .track_focus(&cancel_handle)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            on_cancel(this, window, cx);
+                        })),
+                ),
+        )
+        .child(
+            div()
+                .rounded_md()
+                .border_1()
+                .border_color(save_border)
+                .child(
+                    Button::new(SharedString::from(format!("{id_prefix}-save")), "Save")
+                        .style(ButtonStyle::Filled)
+                        .track_focus(&save_handle)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            on_save(this, window, cx);
+                        })),
+                ),
+        )
+}
+
 /// Plain (editor-free) snapshot of the form's contents, so the validation /
 /// build logic can be exercised without a GPUI context.
 struct CustomAgentFormValues {
@@ -793,6 +1262,7 @@ struct CustomAgentFormValues {
     command: String,
     args: String,
     env: Vec<(String, String)>,
+    display_name: Option<String>,
     default_mode: Option<String>,
     default_config_options: HashMap<String, AgentConfigOptionValue>,
     favorite_config_option_values: HashMap<String, Vec<String>>,
@@ -808,6 +1278,7 @@ fn build_settings_from_form(
         command: form.command.read(cx).text(cx),
         args: form.args.read(cx).text(cx),
         env: read_kv(&form.env, cx),
+        display_name: form.display_name.clone(),
         default_mode: form.default_mode.clone(),
         default_config_options: form.default_config_options.clone(),
         favorite_config_option_values: form.favorite_config_option_values.clone(),
@@ -842,6 +1313,7 @@ fn build_settings_from_values(
     let env = collect_kv(&values.env, "environment variable")?;
 
     let content = CustomAgentServerSettings::Custom {
+        display_name: values.display_name,
         path: command.into(),
         args,
         env,
@@ -960,6 +1432,7 @@ async fn add_custom_agent_settings_entry(
                         settings.agent_servers.get_or_insert_default().insert(
                             server_name,
                             CustomAgentServerSettings::Custom {
+                                display_name: None,
                                 path: "path_to_executable".into(),
                                 args: vec![],
                                 env: HashMap::default(),
@@ -1060,6 +1533,7 @@ mod tests {
             command: "/usr/bin/agent".into(),
             args: String::new(),
             env: Vec::new(),
+            display_name: None,
             default_mode: None,
             default_config_options: HashMap::default(),
             favorite_config_option_values: HashMap::default(),
@@ -1124,6 +1598,7 @@ mod tests {
         assert_eq!(
             content,
             CustomAgentServerSettings::Custom {
+                display_name: None,
                 path: "/usr/bin/agent".into(),
                 args: vec!["--flag".into(), "value".into()],
                 env: expected_env,

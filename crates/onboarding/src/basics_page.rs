@@ -573,6 +573,7 @@ fn render_registry_agent_button(
                 agent_servers.entry(agent_id).or_insert_with(|| {
                     CustomAgentServerSettings::Registry {
                         registry_id: None,
+                        display_name: None,
                         env: Default::default(),
                         default_mode: None,
                         default_config_options: HashMap::default(),

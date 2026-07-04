@@ -721,6 +721,11 @@ impl From<bool> for AgentConfigOptionValue {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CustomAgentServerSettings {
     Custom {
+        /// A custom name for this agent, displayed in the UI in place of the
+        /// default name.
+        ///
+        /// Default: None
+        display_name: Option<String>,
         #[serde(rename = "command")]
         path: PathBuf,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -759,6 +764,11 @@ pub enum CustomAgentServerSettings {
         ///
         /// Default: None
         registry_id: Option<String>,
+        /// A custom name for this agent, displayed in the UI in place of the
+        /// default name.
+        ///
+        /// Default: None
+        display_name: Option<String>,
         /// Additional environment variables to pass to the agent.
         ///
         /// Default: {}

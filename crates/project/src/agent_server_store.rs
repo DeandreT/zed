@@ -232,6 +232,7 @@ impl AgentServerStore {
                 registry_id.to_string(),
                 settings.unwrap_or_else(|| settings::CustomAgentServerSettings::Registry {
                     registry_id: None,
+                    display_name: None,
                     default_mode: None,
                     env: Default::default(),
                     default_config_options: HashMap::default(),
@@ -359,7 +360,11 @@ impl AgentServerStore {
 
         for (name, settings) in new_settings.iter() {
             match settings {
-                CustomAgentServerSettings::Custom { command, .. } => {
+                CustomAgentServerSettings::Custom {
+                    command,
+                    display_name,
+                    ..
+                } => {
                     let agent_name = AgentId(name.clone().into());
                     self.external_agents.insert(
                         agent_name.clone(),
@@ -370,12 +375,15 @@ impl AgentServerStore {
                             }) as Box<dyn ExternalAgentServer>,
                             ExternalAgentSource::Custom,
                             None,
-                            None,
+                            display_name.clone().map(SharedString::from),
                         ),
                     );
                 }
                 CustomAgentServerSettings::Registry {
-                    registry_id, env, ..
+                    registry_id,
+                    display_name: custom_display_name,
+                    env,
+                    ..
                 } => {
                     let registry_id = registry_id.as_deref().unwrap_or(name);
                     let Some(agent) = registry_agents_by_id.get(registry_id) else {
@@ -390,7 +398,12 @@ impl AgentServerStore {
                     };
 
                     let agent_name = AgentId(name.clone().into());
-                    let display_name = registry_agent_display_name(agent.name(), name, registry_id);
+                    let display_name = custom_display_name
+                        .clone()
+                        .map(SharedString::from)
+                        .unwrap_or_else(|| {
+                            registry_agent_display_name(agent.name(), name, registry_id)
+                        });
                     match agent {
                         RegistryAgent::Binary(agent) => {
                             if !agent.supports_current_platform {
@@ -1536,6 +1549,11 @@ impl AllAgentServersSettings {
 #[derive(Clone, JsonSchema, Debug, PartialEq)]
 pub enum CustomAgentServerSettings {
     Custom {
+        /// A custom name for this agent, displayed in the UI in place of the
+        /// default name.
+        ///
+        /// Default: None
+        display_name: Option<String>,
         command: AgentServerCommand,
         /// The default mode to use for this agent.
         ///
@@ -1561,6 +1579,11 @@ pub enum CustomAgentServerSettings {
         ///
         /// Default: None
         registry_id: Option<String>,
+        /// A custom name for this agent, displayed in the UI in place of the
+        /// default name.
+        ///
+        /// Default: None
+        display_name: Option<String>,
         /// Additional environment variables to pass to the agent.
         ///
         /// Default: {}
@@ -1634,6 +1657,7 @@ impl From<settings::CustomAgentServerSettings> for CustomAgentServerSettings {
     fn from(value: settings::CustomAgentServerSettings) -> Self {
         match value {
             settings::CustomAgentServerSettings::Custom {
+                display_name,
                 path,
                 args,
                 env,
@@ -1641,6 +1665,7 @@ impl From<settings::CustomAgentServerSettings> for CustomAgentServerSettings {
                 default_config_options,
                 favorite_config_option_values,
             } => CustomAgentServerSettings::Custom {
+                display_name,
                 command: AgentServerCommand {
                     path: PathBuf::from(shellexpand::tilde(&path.to_string_lossy()).as_ref()),
                     args,
@@ -1652,12 +1677,14 @@ impl From<settings::CustomAgentServerSettings> for CustomAgentServerSettings {
             },
             settings::CustomAgentServerSettings::Registry {
                 registry_id,
+                display_name,
                 env,
                 default_mode,
                 default_config_options,
                 favorite_config_option_values,
             } => CustomAgentServerSettings::Registry {
                 registry_id,
+                display_name,
                 env,
                 default_mode,
                 default_config_options,
@@ -1742,6 +1769,7 @@ mod tests {
                                 name.to_string(),
                                 settings::CustomAgentServerSettings::Registry {
                                     registry_id: None,
+                                    display_name: None,
                                     env: HashMap::default(),
                                     default_mode: None,
                                     default_config_options: HashMap::default(),
@@ -1760,6 +1788,7 @@ mod tests {
     fn make_registry_settings(registry_id: Option<&str>) -> settings::CustomAgentServerSettings {
         settings::CustomAgentServerSettings::Registry {
             registry_id: registry_id.map(str::to_string),
+            display_name: None,
             env: HashMap::default(),
             default_mode: None,
             default_config_options: HashMap::default(),
@@ -2144,6 +2173,35 @@ mod tests {
             assert_eq!(
                 store.agent_display_name(&AgentId::new("test-agent-2")),
                 Some(SharedString::from("test-agent (test-agent-2)"))
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn test_custom_display_name_overrides_default(cx: &mut TestAppContext) {
+        init_test_settings(cx);
+        init_registry(cx, vec![make_npx_agent("test-agent", "1.0.0")]);
+        let mut settings = make_registry_settings(Some("test-agent"));
+        let settings::CustomAgentServerSettings::Registry { display_name, .. } = &mut settings
+        else {
+            panic!("expected registry settings");
+        };
+        *display_name = Some("Work Account".to_string());
+        cx.update(|cx| {
+            AllAgentServersSettings::override_global(
+                AllAgentServersSettings(HashMap::from_iter([(
+                    "test-agent-work".to_string(),
+                    settings.into(),
+                )])),
+                cx,
+            );
+        });
+        let store = create_agent_server_store(cx);
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.agent_display_name(&AgentId::new("test-agent-work")),
+                Some(SharedString::from("Work Account"))
             );
         });
     }

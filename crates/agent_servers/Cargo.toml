@@ -67,6 +67,7 @@ nix.workspace = true
 
 [dev-dependencies]
 client = { workspace = true, features = ["test-support"] }
+credentials_provider.workspace = true
 env_logger.workspace = true
 fs.workspace = true
 
